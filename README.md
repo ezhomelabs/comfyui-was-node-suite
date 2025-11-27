@@ -1,4 +1,6 @@
-# **WAS** Node Suite (Retired) &nbsp; [![Colab](https://camo.githubusercontent.com/84f0493939e0c4de4e6dbe113251b4bfb5353e57134ffd9fcab6b8714514d4d1/68747470733a2f2f636f6c61622e72657365617263682e676f6f676c652e636f6d2f6173736574732f636f6c61622d62616467652e737667)](https://colab.research.google.com/github/WASasquatch/was-node-suite-comfyui/blob/main/ComfyUI_%2B_WAS_Node_Suite_and_ComfyUI_Manager.ipynb) [![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2FWASasquatch%2Fwas-node-suite-comfyui&count_bg=%233D9CC8&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=hits&edge_flat=false)](https://hits.seeyoufarm.com) [![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/ThompsonJordan?country.x=US&locale.x=en_US)
+# **WAS** Node Suite &nbsp; [![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2FWASasquatch%2Fwas-node-suite-comfyui&count_bg=%233D9CC8&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=hits&edge_flat=false)](https://hits.seeyoufarm.com) [![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/ThompsonJordan?country.x=US&locale.x=en_US)
+
+Maintained fork of https://github.com/WASasquatch/was-node-suite-comfyui. Development continues here—issues and pull requests are welcome.
 
 <p align="center">
     <img src="https://user-images.githubusercontent.com/1151589/228982359-4a6215cc-3ca9-4c24-8a7b-d229d7bce277.png">
@@ -6,12 +8,12 @@
 
 ### A node suite for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) with many new nodes, such as image processing, text processing, and more.
 
-#### [Share Workflows](https://github.com/WASasquatch/was-node-suite-comfyui/wiki/Workflow-Examples) to the workflows wiki. Preferably embedded PNGs with workflows, but JSON is OK too. [You can use this tool to add a workflow to a PNG file easily](https://colab.research.google.com/drive/1hQMjNUdhMQ3rw1Wcm3_umvmOMeS_K4s8?usp=sharing).
+#### [Share Workflows](https://github.com/WASasquatch/was-node-suite-comfyui/wiki/Workflow-Examples) to the workflows wiki. Preferably embedded PNGs with workflows, but JSON is OK too.
 #### Consider [donating to the project](https://paypal.me/ThompsonJordan?country.x=US&locale.x=en_US) to help it's continued development.
 
 # Important Updates
 
-- **12/15/2023** WAS-NS is not under active development. I do not have the time and have other obligations. Feel free to fork and continue the project. I will approve appropriate and beneficial PRs.
+- **[Updated 27/11/2025]** This repository continues active development as a maintained fork. Issues and pull requests are welcome.
 - **[Updated 10/8/2023]** BLIP is now a shipped module of WAS-NS and no longer requires the BLIP Repo
  - **[Updated 5/29/2023]** `ASCII` **is deprecated**. The new preferred method of text node output is `STRING`. This is a change from `ASCII` so that it is more clear what data is being passed.
    - The `was_suite_config.json` will automatically set `use_legacy_ascii_text` to `false`.
@@ -405,11 +407,3 @@ If you're running on Linux, or non-admin account on windows you'll want to ensur
     - Tools will be located in the WAS Suite menu.
 
 This method will not install the resources required for Image Crop Face node, and you'll have to download the [./res/](https://github.com/WASasquatch/was-node-suite-comfyui/tree/main/res) folder yourself.
-
-## Installing on Colab
-Create a new cell and add the following code, then run the cell. You may need to edit the path to your `custom_nodes` folder. You can also use the [colab hosted here](https://colab.research.google.com/github/WASasquatch/comfyui-colab-was-node-suite/blob/main/ComfyUI_%2B_WAS_Node_Suite.ipynb)
-
-  - `!git clone https://github.com/WASasquatch/was-node-suite-comfyui /content/ComfyUI/custom_nodes/was-node-suite-comfyui`
-  - `!pip install -r /content/ComfyUI/custom_nodes/was-node-suite-comfyui/requirements.txt`
-  - Restart Colab Runtime (don't disconnect)
-    - Tools will be located in the WAS Suite menu.
