@@ -3099,20 +3099,15 @@ class WAS_Image_Crop_Face:
 
     @classmethod
     def INPUT_TYPES(cls):
+        model_options = cls._get_yolo_models()
+        if not model_options:
+            model_options = ["face_yolov8m.pt"]
         return {
             "required": {
                 "image": ("IMAGE",),
+                "model_name": (model_options,),
+                "max_faces": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
                 "crop_padding_factor": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "cascade_xml": ([
-                                "lbpcascade_animeface.xml",
-                                "haarcascade_frontalface_default.xml",
-                                "haarcascade_frontalface_alt.xml",
-                                "haarcascade_frontalface_alt2.xml",
-                                "haarcascade_frontalface_alt_tree.xml",
-                                "haarcascade_profileface.xml",
-                                "haarcascade_upperbody.xml",
-                                "haarcascade_eye.xml"
-                                ],),
                 }
         }
 
@@ -3121,140 +3116,243 @@ class WAS_Image_Crop_Face:
 
     CATEGORY = "WAS Suite/Image/Process"
 
-    def image_crop_face(self, image, cascade_xml=None, crop_padding_factor=0.25):
+    _face_yolo_cache = {}
+
+    def image_crop_face(self, image, model_name="face_yolov8m.pt", max_faces=1, crop_padding_factor=0.25):
         batch = [image] if image.ndim == 3 else [img for img in image]
 
+        detections = []
+        max_w = 0
+        max_h = 0
+        last_valid_crop = None
+
+        # Pass 1: detect and collect target sizes
+        for img in batch:
+            pil_img = tensor2pil(img)
+            det = self._detect_faces(
+                pil_img,
+                padding=crop_padding_factor,
+                max_faces=max_faces,
+                model_name=model_name,
+                fallback_data=last_valid_crop,
+            )
+            if det["crop_data"] not in (None, False) and len(det["crop_data"]) > 0:
+                last_valid_crop = det["crop_data"]
+            detections.append((pil_img, det))
+            max_w = max(max_w, det["max_width"])
+            max_h = max(max_h, det["max_height"])
+
+        if max_w == 0 or max_h == 0:
+            # No valid detections at all
+            empty = pil2tensor(Image.new("RGB", (512, 512), (0, 0, 0)))
+            return (empty, False)
+
+        # Pass 2: crop using global max_w/max_h
         crops = []
         crop_meta = []
-        for img in batch:
-            crop_tensor, data = self.crop_face(tensor2pil(img), cascade_xml, crop_padding_factor)
-            crops.append(crop_tensor)
-            crop_meta.append(data)
+        for pil_img, det in detections:
+            rects = det["rects"]
+            pad_ws = det["pad_ws"]
+            pad_hs = det["pad_hs"]
+            if rects is None:
+                crops.append(pil2tensor(Image.new("RGB", (max_w, max_h), (0, 0, 0))))
+                crop_meta.append(False)
+                continue
+            for rect, pw, ph in zip(rects, pad_ws, pad_hs):
+                crop_tensor, data = self._crop_fixed_size(
+                    pil_img,
+                    rect,
+                    pw,
+                    ph,
+                    max_w,
+                    max_h,
+                )
+                crops.append(crop_tensor)
+                crop_meta.append(data)
 
-        if len(crops) > 1:
-            max_h = max(t.shape[1] for t in crops)
-            max_w = max(t.shape[2] for t in crops)
-            padded = []
+        # Ensure uniform tensor sizes before concatenation
+        final_h = max(t.shape[1] for t in crops)
+        final_w = max(t.shape[2] for t in crops)
+        if any((t.shape[1], t.shape[2]) != (final_h, final_w) for t in crops):
+            aligned = []
             for t in crops:
-                if t.shape[1] != max_h or t.shape[2] != max_w:
-                    pad_h = max_h - t.shape[1]
-                    pad_w = max_w - t.shape[2]
-                    t = F.pad(t.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), value=0).permute(0, 2, 3, 1)
-                padded.append(t)
-            crops = padded
+                if (t.shape[1], t.shape[2]) != (final_h, final_w):
+                    t = t.permute(0, 3, 1, 2)
+                    t = F.interpolate(t, size=(final_h, final_w), mode="bilinear", align_corners=False)
+                    t = t.permute(0, 2, 3, 1)
+                aligned.append(t)
+            crops = aligned
 
         crop_tensor = torch.cat(crops, dim=0)
         crop_data = crop_meta[0] if len(crop_meta) == 1 else crop_meta
 
         return (crop_tensor, crop_data)
 
-    def crop_face(self, image, cascade_name=None, padding=0.25):
+    def _detect_faces(self, image, padding=0.25, max_faces=1, model_name="face_yolov8m.pt", fallback_data=None):
 
-        import cv2
+        model = self._load_face_yolo(model_name)
+        if model is None:
+            cstr(f"Unable to load YOLO model `{model_name}` from `ComfyUI/models/yolo/`.").error.print()
+            return {"rects": None, "pad_ws": [], "pad_hs": [], "crop_data": [False], "max_width": 0, "max_height": 0}
 
-        img = np.array(image.convert('RGB'))
+        np_img = np.array(image.convert('RGB'))
+        try:
+            results = model(np_img, verbose=False)
+        except TypeError:
+            results = model.predict(np_img, verbose=False)
+        except Exception as e:
+            cstr(f"YOLO face detection failed: {e}").error.print()
+            return {"rects": None, "pad_ws": [], "pad_hs": [], "crop_data": [False], "max_width": 0, "max_height": 0}
 
-        face_location = None
+        boxes = None
+        if results and hasattr(results[0], "boxes"):
+            boxes = results[0].boxes
 
-        cascades = [ os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'lbpcascade_animeface.xml'),
-                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_default.xml'),
-                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_alt.xml'),
-                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_alt2.xml'),
-                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_alt_tree.xml'),
-                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_profileface.xml'),
-                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_upperbody.xml') ]
+        if boxes is None or boxes.xyxy is None or len(boxes) == 0:
+            if fallback_data not in (None, False):
+                cstr("No faces found in the image! Reusing last known face location.").warning.print()
+                cached = fallback_data if isinstance(fallback_data, list) else [fallback_data]
+                # Build detection info from cached crop_data sizes
+                rects = []
+                pad_ws = []
+                pad_hs = []
+                max_w = 0
+                max_h = 0
+                crop_data_out = []
+                for cd in cached[:max_faces]:
+                    try:
+                        crop_size, (left, top, right, bottom) = cd
+                        w = right - left
+                        h = bottom - top
+                        max_w = max(max_w, w)
+                        max_h = max(max_h, h)
+                        rects.append((left, top, right, bottom))
+                        pad_ws.append(0)
+                        pad_hs.append(0)
+                        crop_data_out.append(cd)
+                    except Exception:
+                        continue
+                if not rects:
+                    return {"rects": None, "pad_ws": [], "pad_hs": [], "crop_data": [False], "max_width": 0, "max_height": 0}
+                return {"rects": rects, "pad_ws": pad_ws, "pad_hs": pad_hs, "crop_data": crop_data_out, "max_width": max_w, "max_height": max_h}
+            cstr("No faces found in the image!").warning.print()
+            return {"rects": None, "pad_ws": [], "pad_hs": [], "crop_data": [False], "max_width": 0, "max_height": 0}
 
-        if cascade_name:
-            for cascade in cascades:
-                if os.path.basename(cascade) == cascade_name:
-                    cascades.remove(cascade)
-                    cascades.insert(0, cascade)
-                    break
+        xyxy = boxes.xyxy.detach().cpu().numpy()
+        confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else None
+        order = np.argsort(-confs) if confs is not None else list(range(len(xyxy)))
+        selected_faces = xyxy[order][:max_faces]
 
-        faces = None
-        if not face_location:
-            for cascade in cascades:
-                if not os.path.exists(cascade):
-                    cstr(f"Unable to find cascade XML file at `{cascade}`. Did you pull the latest files from https://github.com/WASasquatch/was-node-suite-comfyui repo?").error.print()
-                    return (pil2tensor(Image.new("RGB", (512,512), (0,0,0))), False)
-                face_cascade = cv2.CascadeClassifier(cascade)
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-                if len(faces) != 0:
-                    cstr(f"Face found with: {os.path.basename(cascade)}").msg.print()
-                    break
-            if len(faces) == 0:
-                cstr("No faces found in the image!").warning.print()
-                return (pil2tensor(Image.new("RGB", (512,512), (0,0,0))), False)
-        else:
-            cstr("Face found with: face_recognition model").warning.print()
-            faces = face_location
+        widths = selected_faces[:, 2] - selected_faces[:, 0]
+        heights = selected_faces[:, 3] - selected_faces[:, 1]
+        pad_ws = np.ceil(widths * padding).astype(int)
+        pad_hs = np.ceil(heights * padding).astype(int)
+        padded_ws = widths + 2 * pad_ws
+        padded_hs = heights + 2 * pad_hs
+        max_w = int(np.max(padded_ws))
+        max_h = int(np.max(padded_hs))
 
-        # Assume there is only one face in the image
-        x, y, w, h = faces[0]
+        rects = []
+        crop_data_out = []
+        for rect, pw, ph in zip(selected_faces, pad_ws, pad_hs):
+            x1, y1, x2, y2 = rect
+            rects.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+            # Placeholder crop_data; will be updated during actual crop
+            crop_data_out.append(False)
 
-        # Check if the face region aligns with the edges of the original image
-        left_adjust = max(0, -x)
-        right_adjust = max(0, x + w - img.shape[1])
-        top_adjust = max(0, -y)
-        bottom_adjust = max(0, y + h - img.shape[0])
+        return {
+            "rects": rects,
+            "pad_ws": pad_ws.tolist(),
+            "pad_hs": pad_hs.tolist(),
+            "crop_data": crop_data_out,
+            "max_width": max_w,
+            "max_height": max_h,
+        }
 
-        # Check if the face region is near any edges, and if so, pad in the opposite direction
-        if left_adjust < w:
-            x += right_adjust
-        elif right_adjust < w:
-            x -= left_adjust
-        if top_adjust < h:
-            y += bottom_adjust
-        elif bottom_adjust < h:
-            y -= top_adjust
+    @classmethod
+    def _get_yolo_models(cls):
+        yolo_dir = os.path.join(MODELS_DIR, 'yolo')
+        if not os.path.isdir(yolo_dir):
+            return []
+        return sorted([f for f in os.listdir(yolo_dir) if os.path.isfile(os.path.join(yolo_dir, f))])
 
-        w -= left_adjust + right_adjust
-        h -= top_adjust + bottom_adjust
+    def _load_face_yolo(self, model_name):
+        cls = self.__class__
+        if model_name in cls._face_yolo_cache:
+            return cls._face_yolo_cache.get(model_name)
 
-        # Calculate padding around face
-        face_size = min(h, w)
-        y_pad = int(face_size * padding)
-        x_pad = int(face_size * padding)
+        try:
+            from ultralytics import YOLO
+        except Exception as e:
+            cstr(f"Ultralytics not available for YOLO detection: {e}").error.print()
+            return None
 
-        # Calculate square coordinates around face
-        center_x = x + w // 2
-        center_y = y + h // 2
-        half_size = (face_size + max(x_pad, y_pad)) // 2
-        top = max(0, center_y - half_size)
-        bottom = min(img.shape[0], center_y + half_size)
-        left = max(0, center_x - half_size)
-        right = min(img.shape[1], center_x + half_size)
+        model_path = os.path.join(MODELS_DIR, 'yolo', model_name)
+        if not os.path.exists(model_path):
+            cstr(f"YOLO model not found at `{model_path}`.").error.print()
+            cls._face_yolo_cache[model_name] = None
+            return None
 
-        # Ensure square crop of the original image
-        crop_size = min(right - left, bottom - top)
-        left = center_x - crop_size // 2
-        right = center_x + crop_size // 2
-        top = center_y - crop_size // 2
-        bottom = center_y + crop_size // 2
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        try:
+            model = YOLO(model_path).to(device)
+            cls._face_yolo_cache[model_name] = model
+        except Exception as e:
+            cstr(f"Failed to load YOLO model `{model_name}`: {e}").error.print()
+            cls._face_yolo_cache[model_name] = None
+        return cls._face_yolo_cache.get(model_name)
 
-        # Crop face from original image
-        face_img = img[top:bottom, left:right, :]
+    def _crop_fixed_size(self, pil_image, rect, pad_w, pad_h, target_w, target_h):
+        x, y, w, h = rect
 
-        # Resize image
-        size = max(face_img.copy().shape[:2])
-        pad_h = (size - face_img.shape[0]) // 2
-        pad_w = (size - face_img.shape[1]) // 2
-        face_img = cv2.copyMakeBorder(face_img, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_CONSTANT, value=[0,0,0])
-        min_size = 64 # Set minimum size for padded image
-        if size < min_size:
-            size = min_size
-        face_img = cv2.resize(face_img, (size, size))
+        left = x - pad_w
+        top = y - pad_h
 
-        # Convert numpy array back to PIL image
-        face_img = Image.fromarray(face_img)
+        # Clamp so the fixed-size crop stays in bounds
+        left = int(max(0, min(left, pil_image.width - target_w)))
+        top = int(max(0, min(top, pil_image.height - target_h)))
+        right = left + target_w
+        bottom = top + target_h
 
-        # Resize image to a multiple of 64
-        original_size = face_img.size
-        face_img.resize((((face_img.size[0] // 64) * 64 + 64), ((face_img.size[1] // 64) * 64 + 64)))
+        if right <= left or bottom <= top:
+            return (pil2tensor(Image.new("RGB", pil_image.size, (0, 0, 0))), False)
 
-        # Return face image and coordinates
-        return (pil2tensor(face_img.convert('RGB')), (original_size, (left, top, right, bottom)))
+        face_img = pil_image.crop((left, top, right, bottom))
+        return (pil2tensor(face_img.convert('RGB')), ((right - left, bottom - top), (left, top, right, bottom)))
+
+    def _crop_from_data(self, image, crop_data_list):
+        """Crop current frame using previous crop_data when detection fails."""
+        crops = []
+        datas = []
+        for crop_data in crop_data_list:
+            try:
+                crop_size, (left, top, right, bottom) = crop_data
+            except Exception:
+                continue
+
+            img_w, img_h = image.size
+            target_w = max(int(right - left), 1)
+            target_h = max(int(bottom - top), 1)
+
+            # Clamp crop box inside the image while keeping requested size
+            left = int(max(0, min(left, img_w - target_w)))
+            top = int(max(0, min(top, img_h - target_h)))
+            right = min(left + target_w, img_w)
+            bottom = min(top + target_h, img_h)
+            left = max(0, right - target_w)
+            top = max(0, bottom - target_h)
+
+            face_img = image.crop((left, top, right, bottom))
+            if crop_size:
+                face_img = face_img.resize(crop_size)
+
+            crops.append(pil2tensor(face_img.convert('RGB')))
+            datas.append((crop_size, (left, top, right, bottom)))
+
+        if not crops:
+            return ([pil2tensor(Image.new("RGB", image.size, (0, 0, 0)))], [False])
+
+        return (crops, datas)
 
 
 # IMAGE PASTE FACE CROP
@@ -3301,25 +3399,44 @@ class WAS_Image_Paste_Face_Crop:
                 raise ValueError(f"crop_data batch size mismatch. Expected {target_len}, got {len(data)}.")
             return [data if data is not None else False] * target_len
 
-        images = [image] if image.ndim == 3 else [img for img in image]
-        crop_images = [crop_image] if crop_image.ndim == 3 else [img for img in crop_image]
+        def to_list(x):
+            if isinstance(x, list):
+                return x
+            return [x] if x.ndim == 3 else [img for img in x]
+
+        images = to_list(image)
+        crop_images = to_list(crop_image)
         crop_images = expand_batch(crop_images, len(images), "crop_image")
         crop_data_list = normalize_crop_data(crop_data, len(images))
 
         result_images = []
         result_masks = []
+        last_valid_data = None
         for img, crop_img, data in zip(images, crop_images, crop_data_list):
-            if data is False:
+            use_data = data
+            if use_data is False and last_valid_data is not None:
+                cstr("No valid crop data found! Using previous frame data instead.").warning.print()
+                use_data = last_valid_data
+
+            if use_data is False:
                 cstr("No valid crop data found!").error.print()
                 result_images.append(img.unsqueeze(0) if img.ndim == 3 else img)
                 result_masks.append(pil2tensor(Image.new("RGB", tensor2pil(img).size, (0, 0, 0))))
                 continue
 
-            res_image, res_mask = self.paste_image(tensor2pil(img), tensor2pil(crop_img), data, crop_blending, crop_sharpening)
+            res_image, res_mask = self.paste_image(tensor2pil(img), tensor2pil(crop_img), use_data, crop_blending, crop_sharpening)
             result_images.append(res_image)
             result_masks.append(res_mask)
+            last_valid_data = use_data
 
-        return (torch.cat(result_images, dim=0), torch.cat(result_masks, dim=0))
+        if len(result_images) == 1:
+            return (result_images[0], result_masks[0])
+
+        same_shape = all((t.shape[1], t.shape[2]) == (result_images[0].shape[1], result_images[0].shape[2]) for t in result_images)
+        if same_shape:
+            return (torch.cat(result_images, dim=0), torch.cat(result_masks, dim=0))
+
+        return (result_images, result_masks)
 
     def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
 
@@ -3579,25 +3696,44 @@ class WAS_Image_Paste_Crop:
                 raise ValueError(f"crop_data batch size mismatch. Expected {target_len}, got {len(data)}.")
             return [data if data is not None else False] * target_len
 
-        images = [image] if image.ndim == 3 else [img for img in image]
-        crop_images = [crop_image] if crop_image.ndim == 3 else [img for img in crop_image]
+        def to_list(x):
+            if isinstance(x, list):
+                return x
+            return [x] if x.ndim == 3 else [img for img in x]
+
+        images = to_list(image)
+        crop_images = to_list(crop_image)
         crop_images = expand_batch(crop_images, len(images), "crop_image")
         crop_data_list = normalize_crop_data(crop_data, len(images))
 
         result_images = []
         result_masks = []
+        last_valid_data = None
         for img, crop_img, data in zip(images, crop_images, crop_data_list):
-            if data is False:
+            use_data = data
+            if use_data is False and last_valid_data is not None:
+                cstr("No valid crop data found! Using previous frame data instead.").warning.print()
+                use_data = last_valid_data
+
+            if use_data is False:
                 cstr("No valid crop data found!").error.print()
                 result_images.append(img.unsqueeze(0) if img.ndim == 3 else img)
                 result_masks.append(pil2tensor(Image.new("RGB", tensor2pil(img).size, (0, 0, 0))))
                 continue
 
-            res_image, res_mask = self.paste_image(tensor2pil(img), tensor2pil(crop_img), data, crop_blending, crop_sharpening)
+            res_image, res_mask = self.paste_image(tensor2pil(img), tensor2pil(crop_img), use_data, crop_blending, crop_sharpening)
             result_images.append(res_image)
             result_masks.append(res_mask)
+            last_valid_data = use_data
 
-        return (torch.cat(result_images, dim=0), torch.cat(result_masks, dim=0))
+        if len(result_images) == 1:
+            return (result_images[0], result_masks[0])
+
+        same_shape = all((t.shape[1], t.shape[2]) == (result_images[0].shape[1], result_images[0].shape[2]) for t in result_images)
+        if same_shape:
+            return (torch.cat(result_images, dim=0), torch.cat(result_masks, dim=0))
+
+        return (result_images, result_masks)
 
     def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
 
@@ -8106,18 +8242,29 @@ class WAS_Mask_Paste_Region:
                 raise ValueError(f"crop_data batch size mismatch. Expected {target_len}, got {len(data)}.")
             return [data if data is not None else False] * target_len
 
-        masks = [mask] if (mask.ndim < 3 or (mask.ndim == 3 and mask.shape[0] == 1)) else [m for m in mask]
-        crop_masks = [crop_mask] if (crop_mask.ndim < 3 or (crop_mask.ndim == 3 and crop_mask.shape[0] == 1)) else [m for m in crop_mask]
+        def to_list(x):
+            if isinstance(x, list):
+                return x
+            return [x] if (x.ndim < 3 or (x.ndim == 3 and x.shape[0] == 1)) else [m for m in x]
+
+        masks = to_list(mask)
+        crop_masks = to_list(crop_mask)
 
         crop_masks = expand_batch(crop_masks, len(masks), "crop_mask")
         crop_data_list = normalize_crop_data(crop_data, len(masks))
 
         result_masks = []
         result_crop_masks = []
+        last_valid_data = None
 
         for m, cm, data in zip(masks, crop_masks, crop_data_list):
             mask_pil = Image.fromarray(np.clip(255. * m.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-            if data is False:
+            use_data = data
+            if use_data is False and last_valid_data is not None:
+                cstr("No valid crop data found! Using previous frame data instead.").warning.print()
+                use_data = last_valid_data
+
+            if use_data is False:
                 cstr("No valid crop data found!").error.print()
                 blank = pil2mask(Image.new("L", mask_pil.size, 0)).unsqueeze(0).unsqueeze(1)
                 result_masks.append(blank)
@@ -8125,12 +8272,20 @@ class WAS_Mask_Paste_Region:
                 continue
 
             mask_crop_pil = Image.fromarray(np.clip(255. * cm.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-            result_mask, result_crop_mask = self.paste_image(mask_pil, mask_crop_pil, data, crop_blending, crop_sharpening)
+            result_mask, result_crop_mask = self.paste_image(mask_pil, mask_crop_pil, use_data, crop_blending, crop_sharpening)
 
             result_masks.append(pil2mask(result_mask).unsqueeze(0).unsqueeze(1))
             result_crop_masks.append(pil2mask(result_crop_mask).unsqueeze(0).unsqueeze(1))
+            last_valid_data = use_data
 
-        return (torch.cat(result_masks, dim=0), torch.cat(result_crop_masks, dim=0))
+        if len(result_masks) == 1:
+            return (result_masks[0], result_crop_masks[0])
+
+        same_shape = all((t.shape[2], t.shape[3]) == (result_masks[0].shape[2], result_masks[0].shape[3]) for t in result_masks)
+        if same_shape:
+            return (torch.cat(result_masks, dim=0), torch.cat(result_crop_masks, dim=0))
+
+        return (result_masks, result_crop_masks)
 
     def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
 
