@@ -45,6 +45,7 @@ import sys
 import datetime
 import time
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 p310_plus = (sys.version_info >= (3, 10))
@@ -3121,7 +3122,31 @@ class WAS_Image_Crop_Face:
     CATEGORY = "WAS Suite/Image/Process"
 
     def image_crop_face(self, image, cascade_xml=None, crop_padding_factor=0.25):
-        return self.crop_face(tensor2pil(image), cascade_xml, crop_padding_factor)
+        batch = [image] if image.ndim == 3 else [img for img in image]
+
+        crops = []
+        crop_meta = []
+        for img in batch:
+            crop_tensor, data = self.crop_face(tensor2pil(img), cascade_xml, crop_padding_factor)
+            crops.append(crop_tensor)
+            crop_meta.append(data)
+
+        if len(crops) > 1:
+            max_h = max(t.shape[1] for t in crops)
+            max_w = max(t.shape[2] for t in crops)
+            padded = []
+            for t in crops:
+                if t.shape[1] != max_h or t.shape[2] != max_w:
+                    pad_h = max_h - t.shape[1]
+                    pad_w = max_w - t.shape[2]
+                    t = F.pad(t.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h), value=0).permute(0, 2, 3, 1)
+                padded.append(t)
+            crops = padded
+
+        crop_tensor = torch.cat(crops, dim=0)
+        crop_data = crop_meta[0] if len(crop_meta) == 1 else crop_meta
+
+        return (crop_tensor, crop_data)
 
     def crop_face(self, image, cascade_name=None, padding=0.25):
 
@@ -3258,12 +3283,43 @@ class WAS_Image_Paste_Face_Crop:
 
     def image_paste_face(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
 
-        if crop_data == False:
-            cstr("No valid crop data found!").error.print()
-            return (image, pil2tensor(Image.new("RGB", tensor2pil(image).size, (0,0,0))))
+        def expand_batch(items, target_len, label):
+            if len(items) == target_len:
+                return items
+            if len(items) == 1:
+                return items * target_len
+            raise ValueError(f"{label} batch size mismatch. Expected {target_len}, got {len(items)}.")
 
-        result_image, result_mask = self.paste_image(tensor2pil(image), tensor2pil(crop_image), crop_data, crop_blending, crop_sharpening)
-        return(result_image, result_mask)
+        def normalize_crop_data(data, target_len):
+            if data is None:
+                data = False
+            if isinstance(data, list):
+                if len(data) == target_len:
+                    return data
+                if len(data) == 1:
+                    return data * target_len
+                raise ValueError(f"crop_data batch size mismatch. Expected {target_len}, got {len(data)}.")
+            return [data if data is not None else False] * target_len
+
+        images = [image] if image.ndim == 3 else [img for img in image]
+        crop_images = [crop_image] if crop_image.ndim == 3 else [img for img in crop_image]
+        crop_images = expand_batch(crop_images, len(images), "crop_image")
+        crop_data_list = normalize_crop_data(crop_data, len(images))
+
+        result_images = []
+        result_masks = []
+        for img, crop_img, data in zip(images, crop_images, crop_data_list):
+            if data is False:
+                cstr("No valid crop data found!").error.print()
+                result_images.append(img.unsqueeze(0) if img.ndim == 3 else img)
+                result_masks.append(pil2tensor(Image.new("RGB", tensor2pil(img).size, (0, 0, 0))))
+                continue
+
+            res_image, res_mask = self.paste_image(tensor2pil(img), tensor2pil(crop_img), data, crop_blending, crop_sharpening)
+            result_images.append(res_image)
+            result_masks.append(res_mask)
+
+        return (torch.cat(result_images, dim=0), torch.cat(result_masks, dim=0))
 
     def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
 
@@ -3505,13 +3561,43 @@ class WAS_Image_Paste_Crop:
 
     def image_paste_crop(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
 
-        if crop_data == False:
-            cstr("No valid crop data found!").error.print()
-            return (image, pil2tensor(Image.new("RGB", tensor2pil(image).size, (0,0,0))))
+        def expand_batch(items, target_len, label):
+            if len(items) == target_len:
+                return items
+            if len(items) == 1:
+                return items * target_len
+            raise ValueError(f"{label} batch size mismatch. Expected {target_len}, got {len(items)}.")
 
-        result_image, result_mask = self.paste_image(tensor2pil(image), tensor2pil(crop_image), crop_data, crop_blending, crop_sharpening)
+        def normalize_crop_data(data, target_len):
+            if data is None:
+                data = False
+            if isinstance(data, list):
+                if len(data) == target_len:
+                    return data
+                if len(data) == 1:
+                    return data * target_len
+                raise ValueError(f"crop_data batch size mismatch. Expected {target_len}, got {len(data)}.")
+            return [data if data is not None else False] * target_len
 
-        return (result_image, result_mask)
+        images = [image] if image.ndim == 3 else [img for img in image]
+        crop_images = [crop_image] if crop_image.ndim == 3 else [img for img in crop_image]
+        crop_images = expand_batch(crop_images, len(images), "crop_image")
+        crop_data_list = normalize_crop_data(crop_data, len(images))
+
+        result_images = []
+        result_masks = []
+        for img, crop_img, data in zip(images, crop_images, crop_data_list):
+            if data is False:
+                cstr("No valid crop data found!").error.print()
+                result_images.append(img.unsqueeze(0) if img.ndim == 3 else img)
+                result_masks.append(pil2tensor(Image.new("RGB", tensor2pil(img).size, (0, 0, 0))))
+                continue
+
+            res_image, res_mask = self.paste_image(tensor2pil(img), tensor2pil(crop_img), data, crop_blending, crop_sharpening)
+            result_images.append(res_image)
+            result_masks.append(res_mask)
+
+        return (torch.cat(result_images, dim=0), torch.cat(result_masks, dim=0))
 
     def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
 
@@ -7930,13 +8016,50 @@ class WAS_Mask_Crop_Region:
 
     def mask_crop_region(self, mask, padding=24, region_type="dominant"):
 
-        mask_pil = Image.fromarray(np.clip(255. * mask.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-        region_mask, crop_data = self.WT.Masking.crop_region(mask_pil, region_type, padding)
-        region_tensor = pil2mask(ImageOps.invert(region_mask)).unsqueeze(0).unsqueeze(1)
+        masks = [mask] if (mask.ndim < 3 or (mask.ndim == 3 and mask.shape[0] == 1)) else [m for m in mask]
 
-        (width, height), (left, top, right, bottom) = crop_data
+        region_tensors = []
+        crop_datas = []
+        tops, lefts, rights, bottoms, widths, heights = [], [], [], [], [], []
 
-        return (region_tensor, crop_data, top, left, right, bottom, width, height)
+        for m in masks:
+            mask_pil = Image.fromarray(np.clip(255. * m.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+            region_mask, crop_data = self.WT.Masking.crop_region(mask_pil, region_type, padding)
+            region_tensor = pil2mask(ImageOps.invert(region_mask)).unsqueeze(0).unsqueeze(1)
+
+            (width, height), (left, top, right, bottom) = crop_data
+            crop_datas.append(crop_data)
+            tops.append(top)
+            lefts.append(left)
+            rights.append(right)
+            bottoms.append(bottom)
+            widths.append(width)
+            heights.append(height)
+            region_tensors.append(region_tensor)
+
+        if len(region_tensors) > 1:
+            max_h = max(t.shape[2] for t in region_tensors)
+            max_w = max(t.shape[3] for t in region_tensors)
+            padded = []
+            for t in region_tensors:
+                if t.shape[2] != max_h or t.shape[3] != max_w:
+                    pad_h = max_h - t.shape[2]
+                    pad_w = max_w - t.shape[3]
+                    t = F.pad(t, (0, pad_w, 0, pad_h), value=0)
+                padded.append(t)
+            region_tensors = padded
+
+        region_tensor = torch.cat(region_tensors, dim=0)
+
+        crop_data_out = crop_datas[0] if len(crop_datas) == 1 else crop_datas
+        top_out = tops[0] if len(tops) == 1 else tops
+        left_out = lefts[0] if len(lefts) == 1 else lefts
+        right_out = rights[0] if len(rights) == 1 else rights
+        bottom_out = bottoms[0] if len(bottoms) == 1 else bottoms
+        width_out = widths[0] if len(widths) == 1 else widths
+        height_out = heights[0] if len(heights) == 1 else heights
+
+        return (region_tensor, crop_data_out, top_out, left_out, right_out, bottom_out, width_out, height_out)
 
 
 # IMAGE PASTE CROP
@@ -7965,17 +8088,49 @@ class WAS_Mask_Paste_Region:
 
     def mask_paste_region(self, mask, crop_mask, crop_data=None, crop_blending=0.25, crop_sharpening=0):
 
-        if crop_data == False:
-            cstr("No valid crop data found!").error.print()
-            return( pil2mask(Image.new("L", (512, 512), 0)).unsqueeze(0).unsqueeze(1),
-                    pil2mask(Image.new("L", (512, 512), 0)).unsqueeze(0).unsqueeze(1) )
+        def expand_batch(items, target_len, label):
+            if len(items) == target_len:
+                return items
+            if len(items) == 1:
+                return items * target_len
+            raise ValueError(f"{label} batch size mismatch. Expected {target_len}, got {len(items)}.")
 
-        mask_pil = Image.fromarray(np.clip(255. * mask.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-        mask_crop_pil = Image.fromarray(np.clip(255. * crop_mask.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+        def normalize_crop_data(data, target_len):
+            if data is None:
+                data = False
+            if isinstance(data, list):
+                if len(data) == target_len:
+                    return data
+                if len(data) == 1:
+                    return data * target_len
+                raise ValueError(f"crop_data batch size mismatch. Expected {target_len}, got {len(data)}.")
+            return [data if data is not None else False] * target_len
 
-        result_mask, result_crop_mask = self.paste_image(mask_pil, mask_crop_pil, crop_data, crop_blending, crop_sharpening)
+        masks = [mask] if (mask.ndim < 3 or (mask.ndim == 3 and mask.shape[0] == 1)) else [m for m in mask]
+        crop_masks = [crop_mask] if (crop_mask.ndim < 3 or (crop_mask.ndim == 3 and crop_mask.shape[0] == 1)) else [m for m in crop_mask]
 
-        return (pil2mask(result_mask).unsqueeze(0).unsqueeze(1), pil2mask(result_crop_mask).unsqueeze(0).unsqueeze(1))
+        crop_masks = expand_batch(crop_masks, len(masks), "crop_mask")
+        crop_data_list = normalize_crop_data(crop_data, len(masks))
+
+        result_masks = []
+        result_crop_masks = []
+
+        for m, cm, data in zip(masks, crop_masks, crop_data_list):
+            mask_pil = Image.fromarray(np.clip(255. * m.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+            if data is False:
+                cstr("No valid crop data found!").error.print()
+                blank = pil2mask(Image.new("L", mask_pil.size, 0)).unsqueeze(0).unsqueeze(1)
+                result_masks.append(blank)
+                result_crop_masks.append(blank.clone())
+                continue
+
+            mask_crop_pil = Image.fromarray(np.clip(255. * cm.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+            result_mask, result_crop_mask = self.paste_image(mask_pil, mask_crop_pil, data, crop_blending, crop_sharpening)
+
+            result_masks.append(pil2mask(result_mask).unsqueeze(0).unsqueeze(1))
+            result_crop_masks.append(pil2mask(result_crop_mask).unsqueeze(0).unsqueeze(1))
+
+        return (torch.cat(result_masks, dim=0), torch.cat(result_crop_masks, dim=0))
 
     def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
 
