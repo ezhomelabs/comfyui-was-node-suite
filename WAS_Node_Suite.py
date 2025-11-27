@@ -3091,9 +3091,9 @@ class WAS_Image_Style_Filter:
         return (tensors, )
 
 
-# IMAGE CROP FACE
+# IMAGE CROP OBJECT (YOLO)
 
-class WAS_Image_Crop_Face:
+class WAS_Image_Crop_Object:
     def __init__(self):
         pass
 
@@ -3112,13 +3112,13 @@ class WAS_Image_Crop_Face:
         }
 
     RETURN_TYPES = ("IMAGE", "CROP_DATA")
-    FUNCTION = "image_crop_face"
+    FUNCTION = "image_crop_object"
 
     CATEGORY = "WAS Suite/Image/Process"
 
     _face_yolo_cache = {}
 
-    def image_crop_face(self, image, model_name="face_yolov8m.pt", max_faces=1, crop_padding_factor=0.25):
+    def image_crop_object(self, image, model_name="face_yolov8m.pt", max_faces=1, crop_padding_factor=0.25):
         batch = [image] if image.ndim == 3 else [img for img in image]
 
         detections = []
@@ -3355,9 +3355,9 @@ class WAS_Image_Crop_Face:
         return (crops, datas)
 
 
-# IMAGE PASTE FACE CROP
+# IMAGE PASTE OBJECT CROP
 
-class WAS_Image_Paste_Face_Crop:
+class WAS_Image_Paste_Object_Crop:
     def __init__(self):
         pass
 
@@ -3375,11 +3375,11 @@ class WAS_Image_Paste_Face_Crop:
 
     RETURN_TYPES = ("IMAGE", "IMAGE")
     RETURN_NAMES = ("IMAGE", "MASK_IMAGE")
-    FUNCTION = "image_paste_face"
+    FUNCTION = "image_paste_object"
 
     CATEGORY = "WAS Suite/Image/Process"
 
-    def image_paste_face(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
+    def image_paste_object(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
 
         def expand_batch(items, target_len, label):
             if len(items) == target_len:
@@ -14744,12 +14744,12 @@ NODE_CLASS_MAPPINGS = {
     "Image Canny Filter": WAS_Canny_Filter,
     "Image Chromatic Aberration": WAS_Image_Chromatic_Aberration,
     "Image Color Palette": WAS_Image_Color_Palette,
-    "Image Crop Face": WAS_Image_Crop_Face,
+    "Image Crop Object": WAS_Image_Crop_Object,
     "Image Crop Location": WAS_Image_Crop_Location,
     "Image Crop Square Location": WAS_Image_Crop_Square_Location,
     "Image Displacement Warp": WAS_Image_Displacement_Warp,
     "Image Lucy Sharpen": WAS_Lucy_Sharpen,
-    "Image Paste Face": WAS_Image_Paste_Face_Crop,
+    "Image Paste Object": WAS_Image_Paste_Object_Crop,
     "Image Paste Crop": WAS_Image_Paste_Crop,
     "Image Paste Crop by Location": WAS_Image_Paste_Crop_Location,
     "Image Pixelate": WAS_Image_Pixelate,
